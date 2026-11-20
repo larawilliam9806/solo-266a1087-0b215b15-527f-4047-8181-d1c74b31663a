@@ -69,15 +69,29 @@ class TotalsRegistration(StrictModel):
         return items
 
 
+class TotalsRevision(TotalsRegistration):
+    """A full replacement of the registered district/industry totals.
+
+    ``expected_registration_version`` is the registration version the editor
+    saw.  It may be omitted only while the quarter is still on version 1
+    (never revised); once a revision exists every mutating call must name the
+    version it was based on.
+    """
+
+    expected_registration_version: StrictInt | None = Field(default=None, ge=1)
+
+
 class DetailSubmission(StrictModel):
     values: list[list[Count]]
     must_public: list[CellRef] = Field(default_factory=list, max_length=64)
     expected_version: StrictInt | None = Field(default=None, ge=1)
+    expected_registration_version: StrictInt | None = Field(default=None, ge=1)
 
 
 class MaskSubmission(StrictModel):
     cells: list[CellRef] = Field(default_factory=list, max_length=64)
     detail_version: StrictInt | None = Field(default=None, ge=1)
+    expected_registration_version: StrictInt | None = Field(default=None, ge=1)
 
 
 class SuggestionRequest(StrictModel):
@@ -88,6 +102,7 @@ class SuggestionRequest(StrictModel):
 class PublishRequest(StrictModel):
     detail_version: StrictInt | None = Field(default=None, ge=1)
     mask_version: StrictInt | None = Field(default=None, ge=1)
+    expected_registration_version: StrictInt | None = Field(default=None, ge=1)
 
 
 class TokenRequest(StrictModel):

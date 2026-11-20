@@ -17,6 +17,7 @@ from .models import (
     SuggestionRequest,
     TokenRequest,
     TotalsRegistration,
+    TotalsRevision,
 )
 from .service import BulletinService
 
@@ -114,6 +115,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def register_totals(quarter: Quarter, editor: Editor,
                         body: TotalsRegistration = Body(...)) -> dict[str, Any]:
         return service.register_totals(quarter, body, editor)
+
+    @app.post("/api/v1/editor/quarters/{quarter}/totals/revisions")
+    def revise_totals(quarter: Quarter, editor: Editor,
+                      body: TotalsRevision = Body(...)) -> dict[str, Any]:
+        return service.revise_totals(quarter, body, editor)
 
     @app.post("/api/v1/editor/quarters/{quarter}/detail")
     def submit_detail(quarter: Quarter, editor: Editor,

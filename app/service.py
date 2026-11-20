@@ -3,18 +3,24 @@
 Lifecycle of one quarter:
 
 1. ``register_totals`` fixes the district and industry labels and their
-   published totals.  This is immutable afterwards (published numbers may not
-   be quietly rewritten).
-2. ``submit_detail`` stores a new immutable detail version, validating that its
-   margins match the registered totals and that no 1-4 household cell is put on
-   the must-public list.
-3. ``put_mask`` stores the editor's masking for the *current* detail version.
+   published totals as registration version 1.
+2. ``revise_totals`` replaces the totals with a new, whole registration
+   version while the old one is archived.  A pure row/column re-ordering
+   carries the current detail, must-public cells and mask along by name; a
+   change of names or household counts invalidates the working detail, which
+   must be resubmitted.  Published quarters cannot be revised.
+3. ``submit_detail`` stores a new immutable detail version against the current
+   registration, validating that its margins match that registration's totals
+   and that no 1-4 household cell is put on the must-public list.
+4. ``put_mask`` stores the editor's masking for the *current* detail version.
    A mask is bound to a detail version, so editing the detail implicitly
    invalidates the old masking plan (it can never be reused by accident).
-4. ``publish`` re-runs the full validation at the moment of publication and
+5. ``publish`` re-runs the full validation at the moment of publication and
    stores an immutable snapshot.  A failed publish leaves the previous
    bulletin untouched.
 
+Every mutating call names the registration version it was based on; the
+version may be omitted only while the registration has never been revised.
 Only one bulletin per quarter: the first successful publish wins, everything
 afterwards is a 409 conflict.
 """
@@ -35,6 +41,7 @@ from .models import (
     MaskSubmission,
     PublishRequest,
     TotalsRegistration,
+    TotalsRevision,
 )
 
 
@@ -184,11 +191,23 @@ class BulletinService:
         ).fetchone()
 
     @staticmethod
-    def _latest_detail(conn, quarter: str):
+    def _latest_detail(conn, quarter: str, registration_version: int | None = None):
+        """Newest detail version, optionally restricted to one registration.
+
+        Detail versions only keep accruing across revisions (they are never
+        rewritten), so every operation on the "current" table must scope to
+        the current registration: archived versions belong to archived totals.
+        """
+        if registration_version is None:
+            return conn.execute(
+                "SELECT * FROM detail_versions WHERE quarter=? "
+                "ORDER BY version DESC LIMIT 1",
+                (quarter,),
+            ).fetchone()
         return conn.execute(
             "SELECT * FROM detail_versions WHERE quarter=? "
-            "ORDER BY version DESC LIMIT 1",
-            (quarter,),
+            "AND registration_version=? ORDER BY version DESC LIMIT 1",
+            (quarter, registration_version),
         ).fetchone()
 
     @staticmethod
@@ -206,6 +225,47 @@ class BulletinService:
     @staticmethod
     def _cell_list(cells) -> list[dict]:
         return [{"row": r, "col": c} for r, c in sorted(cells)]
+
+    @staticmethod
+    def _check_registration_version(q, expected: int | None) -> int:
+        """Validate the "version I saw" guard shared by every mutating call.
+
+        The guard may be omitted only while the registration has never been
+        revised (still on version 1).  A wrong version is a conflict: another
+        editor changed the totals in the meantime, so the caller must reload.
+        """
+        current = q["registration_version"]
+        if expected is None:
+            if current != 1:
+                raise conflict(
+                    "registration_version_required",
+                    "the totals have been revised; name the registration "
+                    "version you are working from",
+                    {"current_registration_version": current},
+                )
+            return current
+        if expected != current:
+            raise conflict(
+                "stale_registration_version",
+                "the registered totals changed since this request was prepared",
+                {"expected_registration_version": expected,
+                 "current_registration_version": current},
+            )
+        return current
+
+    @staticmethod
+    def _reorder_maps(old_labels: list[str], new_labels: list[str]
+                      ) -> list[int] | None:
+        """Position map old -> new when the two label sets are identical.
+
+        Returns ``None`` when a name appears or disappears, which means the
+        revision is a structural change rather than a pure row/column
+        re-ordering (names or their household counts changed).
+        """
+        if len(old_labels) != len(new_labels) or set(old_labels) != set(new_labels):
+            return None
+        position = {name: i for i, name in enumerate(new_labels)}
+        return [position[name] for name in old_labels]
 
     # -------------------------------------------------------------- register
 
@@ -245,14 +305,31 @@ class BulletinService:
                     )
                 conn.execute(
                     "INSERT INTO quarters(quarter, district_labels, "
-                    "industry_labels, row_totals, col_totals, registered_at, "
-                    "registered_by) VALUES(?,?,?,?,?,?,?)",
+                    "industry_labels, row_totals, col_totals, "
+                    "registration_version, registered_at, registered_by) "
+                    "VALUES(?,?,?,?,?,1,?,?)",
                     (
                         quarter,
                         json.dumps([d.name for d in districts]),
                         json.dumps([i.name for i in industries]),
                         json.dumps(row_totals),
                         json.dumps(col_totals),
+                        registered_at,
+                        token_id,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO totals_revisions(quarter, version, "
+                    "district_labels, industry_labels, row_totals, col_totals, "
+                    "change_kind, revised_at, revised_by) "
+                    "VALUES(?,1,?,?,?,?,?,?,?)",
+                    (
+                        quarter,
+                        json.dumps([d.name for d in districts]),
+                        json.dumps([i.name for i in industries]),
+                        json.dumps(row_totals),
+                        json.dumps(col_totals),
+                        "initial",
                         registered_at,
                         token_id,
                     ),
@@ -266,6 +343,7 @@ class BulletinService:
             bulletin = None
         return {
             "quarter": quarter,
+            "registration_version": 1,
             "districts": [d.name for d in districts],
             "industries": [i.name for i in industries],
             "row_totals": row_totals,
@@ -275,6 +353,222 @@ class BulletinService:
             "bulletin": bulletin,
             "note": "published totals are now fixed for this quarter",
         }
+
+    # --------------------------------------------------------------- revision
+
+    def revise_totals(self, quarter: str, body: TotalsRevision,
+                      token_id: int | None) -> dict[str, Any]:
+        """Replace the registered totals with a whole new registration version.
+
+        Two shapes of revision are supported:
+
+        * ``reorder`` -- the same district/industry names with the same
+          per-name totals, only their order changed.  The current detail table
+          is re-arranged by name, must-public cells and stored masks are moved
+          to the matching positions, and a new detail version (plus its mask,
+          when one existed) is archived under the new registration.
+        * ``breaking`` -- a name or a per-name household count changed.  The
+          old detail tables do not match the new margins and are kept archived
+          only; the editor must submit a fresh detail before work can resume.
+
+        Either way the previous registration, detail versions and masks stay
+        on file.  Any validation failure raises inside the transaction, so the
+        previously valid registration and base table remain in force.
+        """
+        from .db import connect
+
+        districts = body.districts
+        industries = body.industries
+        new_row_totals = [d.total for d in districts]
+        new_col_totals = [i.total for i in industries]
+        if sum(new_row_totals) != sum(new_col_totals):
+            raise ApiError(
+                422,
+                "totals_inconsistent",
+                "the sum of district totals differs from the sum of industry "
+                "totals",
+                {
+                    "district_sum": sum(new_row_totals),
+                    "industry_sum": sum(new_col_totals),
+                    "delta": sum(new_row_totals) - sum(new_col_totals),
+                },
+            )
+
+        revised_at = now()
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                q = self._quarter_row(conn, quarter)
+                current_version = q["registration_version"]
+                self._check_registration_version(
+                    q, body.expected_registration_version)
+
+                # A published quarter is sealed: its snapshot is already public
+                # and may never be revised out from under it.
+                if self._bulletin_row(conn, quarter) is not None:
+                    raise conflict(
+                        "bulletin_already_published",
+                        f"{quarter} already has a published bulletin; its "
+                        f"registered totals can no longer be revised",
+                        {"quarter": quarter,
+                         "registration_version": current_version},
+                    )
+
+                old_districts = json.loads(q["district_labels"])
+                old_industries = json.loads(q["industry_labels"])
+                old_row_totals = json.loads(q["row_totals"])
+                old_col_totals = json.loads(q["col_totals"])
+
+                old_by_district = dict(zip(old_districts, old_row_totals))
+                old_by_industry = dict(zip(old_industries, old_col_totals))
+                rows_reordered = (
+                    old_by_district
+                    == dict(zip([d.name for d in districts], new_row_totals))
+                )
+                cols_reordered = (
+                    old_by_industry
+                    == dict(zip([i.name for i in industries], new_col_totals))
+                )
+                is_reorder = rows_reordered and cols_reordered
+
+                new_version = current_version + 1
+                new_district_labels = [d.name for d in districts]
+                new_industry_labels = [i.name for i in industries]
+
+                # Rewrite the "current" registration pointer and archive the
+                # old one (already in totals_revisions) alongside the new one.
+                conn.execute(
+                    "UPDATE quarters SET district_labels=?, industry_labels=?, "
+                    "row_totals=?, col_totals=?, registration_version=?, "
+                    "registered_at=?, registered_by=? WHERE quarter=?",
+                    (
+                        json.dumps(new_district_labels),
+                        json.dumps(new_industry_labels),
+                        json.dumps(new_row_totals),
+                        json.dumps(new_col_totals),
+                        new_version,
+                        revised_at,
+                        token_id,
+                        quarter,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO totals_revisions(quarter, version, "
+                    "district_labels, industry_labels, row_totals, col_totals, "
+                    "change_kind, revised_at, revised_by) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        quarter, new_version,
+                        json.dumps(new_district_labels),
+                        json.dumps(new_industry_labels),
+                        json.dumps(new_row_totals),
+                        json.dumps(new_col_totals),
+                        "reorder" if is_reorder else "breaking",
+                        revised_at,
+                        token_id,
+                    ),
+                )
+
+                carried_detail_version = None
+                carried_mask_version = None
+                if is_reorder:
+                    carried_detail_version, carried_mask_version = (
+                        self._carry_reordered_detail(
+                            conn, quarter, new_version,
+                            new_district_labels, new_industry_labels,
+                            old_districts, old_industries, revised_at, token_id,
+                        )
+                    )
+        finally:
+            conn.close()
+
+        state = self.get_admin_state(quarter)
+        state["change_kind"] = "reorder" if is_reorder else "breaking"
+        state["previous_registration_version"] = current_version
+        state["registration_version"] = new_version
+        if carried_detail_version is not None:
+            state["carried_detail_version"] = carried_detail_version
+            state["carried_mask_version"] = carried_mask_version
+        elif is_reorder:
+            state["carried_detail_version"] = None
+            state["carried_mask_version"] = None
+        else:
+            state["note"] = (
+                "names or household counts changed; submit a fresh detail "
+                "table against the new registration"
+            )
+        return state
+
+    def _carry_reordered_detail(self, conn, quarter, new_reg_version,
+                                new_district_labels, new_industry_labels,
+                                old_district_labels, old_industry_labels,
+                                revised_at, token_id
+                                ) -> tuple[int | None, int | None]:
+        """Rebuild the current detail under a reorder-only registration.
+
+        Returns the new detail version and the mask version carried across
+        (``None`` when no detail or no mask existed).
+        """
+        latest = self._latest_detail(
+            conn, quarter, new_reg_version - 1)
+        if latest is None:
+            return None, None
+
+        row_map = self._reorder_maps(old_district_labels, new_district_labels)
+        col_map = self._reorder_maps(old_industry_labels, new_industry_labels)
+        assert row_map is not None and col_map is not None
+        # ``row_map`` answers "where did old row r go?"; filling the new table
+        # needs the inverse: "which old row now sits at new row r?".
+        inv_rows = [0] * len(row_map)
+        for old_r, new_r in enumerate(row_map):
+            inv_rows[new_r] = old_r
+        inv_cols = [0] * len(col_map)
+        for old_c, new_c in enumerate(col_map):
+            inv_cols[new_c] = old_c
+
+        old_values = json.loads(latest["values_json"])
+        new_values = [
+            [old_values[inv_rows[new_r]][inv_cols[new_c]]
+             for new_c in range(len(inv_cols))]
+            for new_r in range(len(inv_rows))
+        ]
+        # Must-public cells travel with their cell content to the new spot.
+        old_public = _cells(json.loads(latest["must_public"]))
+        new_public = sorted(
+            [row_map[r], col_map[c]] for r, c in old_public
+        )
+
+        new_detail_version = latest["version"] + 1
+        conn.execute(
+            "INSERT INTO detail_versions(quarter, version, registration_version, "
+            "values_json, must_public, created_at, created_by) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                quarter, new_detail_version, new_reg_version,
+                json.dumps(new_values), json.dumps(new_public),
+                revised_at, token_id,
+            ),
+        )
+
+        carried_mask_version = None
+        old_mask = self._mask_row(conn, quarter, latest["version"])
+        if old_mask is not None:
+            old_cells = _cells(json.loads(old_mask["cells_json"]))
+            new_cells = sorted(
+                [row_map[r], col_map[c]] for r, c in old_cells
+            )
+            # Mask versions restart at 1 per detail version, exactly as a
+            # freshly saved plan would; the cells are the only thing carried.
+            carried_mask_version = 1
+            conn.execute(
+                "INSERT INTO mask_plans(quarter, detail_version, mask_version, "
+                "cells_json, updated_at, updated_by) VALUES(?,?,?,?,?,?)",
+                (
+                    quarter, new_detail_version, carried_mask_version,
+                    json.dumps(new_cells), revised_at, token_id,
+                ),
+            )
+        return new_detail_version, carried_mask_version
 
     # ----------------------------------------------------------------- detail
 
@@ -286,6 +580,8 @@ class BulletinService:
         try:
             with transaction(conn):
                 q = self._quarter_row(conn, quarter)
+                reg_version = self._check_registration_version(
+                    q, body.expected_registration_version)
                 row_totals = json.loads(q["row_totals"])
                 col_totals = json.loads(q["col_totals"])
                 validate_dimensions(body.values, len(row_totals), len(col_totals))
@@ -294,7 +590,7 @@ class BulletinService:
                 if mismatches:
                     raise totals_mismatch(mismatches)
 
-                latest = self._latest_detail(conn, quarter)
+                latest = self._latest_detail(conn, quarter, reg_version)
                 current_version = latest["version"] if latest else 0
                 if body.expected_version is not None and \
                         body.expected_version != current_version:
@@ -324,13 +620,22 @@ class BulletinService:
                         {"cells": self._cell_list(sensitive_public)},
                     )
 
-                new_version = current_version + 1
+                # Version numbers accrue across the whole quarter, but each
+                # row records which registration its margins were checked
+                # against, so archived versions stay attached to archived
+                # totals.
+                global_latest = self._latest_detail(conn, quarter)
+                new_version = (
+                    global_latest["version"] + 1 if global_latest else 1
+                )
                 conn.execute(
-                    "INSERT INTO detail_versions(quarter, version, values_json, "
-                    "must_public, created_at, created_by) VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO detail_versions(quarter, version, "
+                    "registration_version, values_json, must_public, "
+                    "created_at, created_by) VALUES(?,?,?,?,?,?,?)",
                     (
                         quarter,
                         new_version,
+                        reg_version,
                         json.dumps(body.values),
                         json.dumps(sorted([r, c] for r, c in public)),
                         now(),
@@ -361,8 +666,10 @@ class BulletinService:
         conn = connect(self.db_path)
         try:
             with transaction(conn):
-                self._quarter_row(conn, quarter)
-                latest = self._latest_detail(conn, quarter)
+                q = self._quarter_row(conn, quarter)
+                reg_version = self._check_registration_version(
+                    q, body.expected_registration_version)
+                latest = self._latest_detail(conn, quarter, reg_version)
                 if latest is None:
                     raise ApiError(409, "detail_required",
                                    "submit a detail version before masking")
@@ -445,8 +752,9 @@ class BulletinService:
 
         conn = connect(self.db_path)
         try:
-            self._quarter_row(conn, quarter)
-            latest = self._latest_detail(conn, quarter)
+            q = self._quarter_row(conn, quarter)
+            reg_version = q["registration_version"]
+            latest = self._latest_detail(conn, quarter, reg_version)
             if latest is None:
                 raise ApiError(409, "detail_required",
                                "submit a detail version before requesting "
@@ -493,6 +801,8 @@ class BulletinService:
         try:
             with transaction(conn):
                 q = self._quarter_row(conn, quarter)
+                reg_version = self._check_registration_version(
+                    q, body.expected_registration_version)
                 existing = self._bulletin_row(conn, quarter)
                 if existing is not None:
                     raise conflict(
@@ -503,7 +813,7 @@ class BulletinService:
                          "published_at": existing["published_at"],
                          "detail_version": existing["detail_version"]},
                     )
-                latest = self._latest_detail(conn, quarter)
+                latest = self._latest_detail(conn, quarter, reg_version)
                 if latest is None:
                     raise ApiError(409, "detail_required",
                                    "submit a detail version before publishing")
@@ -519,9 +829,11 @@ class BulletinService:
                 if mask_row is None:
                     older = conn.execute(
                         "SELECT mask_version, detail_version FROM mask_plans "
-                        "WHERE quarter=? AND detail_version<? "
+                        "WHERE quarter=? AND detail_version<? AND detail_version "
+                        "IN (SELECT version FROM detail_versions WHERE quarter=? "
+                        "AND registration_version=?) "
                         "ORDER BY detail_version DESC LIMIT 1",
-                        (quarter, latest["version"]),
+                        (quarter, latest["version"], quarter, reg_version),
                     ).fetchone()
                     if older is not None:
                         raise conflict(
@@ -581,12 +893,14 @@ class BulletinService:
                 try:
                     conn.execute(
                         "INSERT INTO bulletins(quarter, detail_version, "
-                        "mask_version, payload_json, published_at, published_by) "
-                        "VALUES(?,?,?,?,?,?)",
+                        "mask_version, registration_version, payload_json, "
+                        "published_at, published_by) "
+                        "VALUES(?,?,?,?,?,?,?)",
                         (
                             quarter,
                             latest["version"],
                             mask_row["mask_version"],
+                            reg_version,
                             json.dumps(payload),
                             now(),
                             token_id,
@@ -676,13 +990,20 @@ class BulletinService:
         conn = connect(self.db_path)
         try:
             q = self._quarter_row(conn, quarter)
-            latest = self._latest_detail(conn, quarter)
+            reg_version = q["registration_version"]
+            latest = self._latest_detail(conn, quarter, reg_version)
             mask_row = (self._mask_row(conn, quarter, latest["version"])
                         if latest else None)
             bulletin = self._bulletin_row(conn, quarter)
             versions = conn.execute(
-                "SELECT version, created_at FROM detail_versions "
-                "WHERE quarter=? ORDER BY version",
+                "SELECT version, registration_version, created_at "
+                "FROM detail_versions WHERE quarter=? AND "
+                "registration_version=? ORDER BY version",
+                (quarter, reg_version),
+            ).fetchall()
+            revisions = conn.execute(
+                "SELECT version, change_kind, revised_at FROM "
+                "totals_revisions WHERE quarter=? ORDER BY version",
                 (quarter,),
             ).fetchall()
         finally:
@@ -690,15 +1011,27 @@ class BulletinService:
 
         state: dict[str, Any] = {
             "quarter": quarter,
+            "registration_version": reg_version,
             "districts": json.loads(q["district_labels"]),
             "industries": json.loads(q["industry_labels"]),
             "row_totals": json.loads(q["row_totals"]),
             "col_totals": json.loads(q["col_totals"]),
+            # The detail versions usable against the current registration;
+            # versions archived under older registrations stay on file but are
+            # not part of the working set.
             "detail_versions": [
-                {"version": row["version"], "created_at": row["created_at"]}
+                {"version": row["version"],
+                 "registration_version": row["registration_version"],
+                 "created_at": row["created_at"]}
                 for row in versions
             ],
             "current_detail_version": latest["version"] if latest else None,
+            "registration_history": [
+                {"version": row["version"],
+                 "change_kind": row["change_kind"],
+                 "revised_at": row["revised_at"]}
+                for row in revisions
+            ],
             "mask_version": mask_row["mask_version"] if mask_row else None,
             "masked_cells": (
                 [{"row": r, "col": c}
@@ -709,6 +1042,9 @@ class BulletinService:
             "published_at": bulletin["published_at"] if bulletin else None,
             "bulletin_detail_version": (
                 bulletin["detail_version"] if bulletin else None
+            ),
+            "bulletin_registration_version": (
+                bulletin["registration_version"] if bulletin else None
             ),
         }
         if latest and mask_row:
